@@ -1,0 +1,243 @@
+name: Build Android APK (Linella Fresh PRO — Side-by-Side Standalone App)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Prepare Web Files, Bundle Offline Vendor JS Libraries, and Config
+        run: |
+          mkdir -p build_app/www/vendor
+          HTML_FILE=$(find . -maxdepth 4 \( -name "index.html" -o -name "*Linella_Fresh_PRO*.html" -o -name "*ExpiryGuard*.html" -o -name "*expiry_guard*.html" \) | head -n 1)
+          if [ -n "$HTML_FILE" ]; then
+            cp "$HTML_FILE" build_app/www/index.html
+          else
+            echo "HTML file not found!"
+            exit 1
+          fi
+
+          # Download CDN vendor scripts locally into build_app/www/vendor/ so APK works 100% offline on first boot in Airplane Mode
+          curl -sL "https://cdn.tailwindcss.com/3.4.17" -o build_app/www/vendor/tailwindcss.js || true
+          curl -sL "https://unpkg.com/lucide@latest" -o build_app/www/vendor/lucide.js || true
+          curl -sL "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" -o build_app/www/vendor/xlsx.full.min.js || true
+          curl -sL "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js" -o build_app/www/vendor/tesseract.min.js || true
+          curl -sL "https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" -o build_app/www/vendor/qrcode.min.js || true
+
+          if [ -s build_app/www/vendor/tailwindcss.js ]; then
+            sed -i "s|https://cdn.tailwindcss.com/3.4.17|./vendor/tailwindcss.js|g" build_app/www/index.html
+          fi
+          if [ -s build_app/www/vendor/lucide.js ]; then
+            sed -i "s|https://unpkg.com/lucide@latest|./vendor/lucide.js|g" build_app/www/index.html
+          fi
+          if [ -s build_app/www/vendor/xlsx.full.min.js ]; then
+            sed -i "s|https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js|./vendor/xlsx.full.min.js|g" build_app/www/index.html
+          fi
+          if [ -s build_app/www/vendor/tesseract.min.js ]; then
+            sed -i "s|https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js|./vendor/tesseract.min.js|g" build_app/www/index.html
+          fi
+          if [ -s build_app/www/vendor/qrcode.min.js ]; then
+            sed -i "s|https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js|./vendor/qrcode.min.js|g" build_app/www/index.html
+          fi
+
+          cd build_app
+          echo '{"name":"linella-fresh-pro","version":"6.0.0","dependencies":{"@capacitor/android":"^6.0.0","@capacitor/core":"^6.0.0"},"devDependencies":{"@capacitor/cli":"^6.0.0"}}' > package.json
+          echo '{"appId":"md.linella.freshpro","appName":"Linella Fresh PRO","webDir":"www","bundledWebRuntime":false,"server":{"androidScheme":"https"}}' > capacitor.config.json
+
+      - name: Install Capacitor and Generate Android Project
+        working-directory: ./build_app
+        run: |
+          npm install
+          npx cap add android
+          npx cap sync android
+
+      - name: Inject Singleton Offline Google ML Kit (OCR & Barcode) + Camera Permissions
+        working-directory: ./build_app
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          sed -i 's|<application|<uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.VIBRATE" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <application android:usesCleartextTraffic="true"|' "$MANIFEST"
+
+          # Add bundled offline Google ML Kit dependencies to android/app/build.gradle
+          APP_GRADLE="android/app/build.gradle"
+          sed -i "s|dependencies {|dependencies {\n    implementation 'com.google.mlkit:text-recognition:16.0.0'\n    implementation 'com.google.mlkit:barcode-scanning:17.2.0'|" "$APP_GRADLE"
+
+          MAIN_ACT=$(find android/app/src/main/java -name "MainActivity.java" | head -n 1)
+          cat << 'JAVA' > "$MAIN_ACT"
+          package md.linella.freshpro;
+
+          import android.Manifest;
+          import android.content.pm.PackageManager;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.os.Bundle;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.BridgeActivity;
+          import com.google.mlkit.vision.barcode.BarcodeScanner;
+          import com.google.mlkit.vision.barcode.BarcodeScanning;
+          import com.google.mlkit.vision.barcode.common.Barcode;
+          import com.google.mlkit.vision.common.InputImage;
+          import com.google.mlkit.vision.text.TextRecognition;
+          import com.google.mlkit.vision.text.TextRecognizer;
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicBoolean;
+          import org.json.JSONObject;
+
+          public class MainActivity extends BridgeActivity {
+              private BarcodeScanner barcodeScanner;
+              private TextRecognizer textRecognizer;
+              private ExecutorService mlExecutor;
+              private final AtomicBoolean isMlKitBusy = new AtomicBoolean(false);
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  barcodeScanner = BarcodeScanning.getClient();
+                  textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+                  mlExecutor = Executors.newSingleThreadExecutor();
+
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                      ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO}, 101);
+                  }
+                  try {
+                      WebView webView = getBridge().getWebView();
+                      if (webView != null) {
+                          webView.addJavascriptInterface(new AndroidMlKitBridge(), "AndroidMlKit");
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              @Override
+              public void onDestroy() {
+                  try {
+                      if (barcodeScanner != null) barcodeScanner.close();
+                      if (textRecognizer != null) textRecognizer.close();
+                      if (mlExecutor != null) mlExecutor.shutdownNow();
+                  } catch (Exception ignored) {}
+                  super.onDestroy();
+              }
+
+              public class AndroidMlKitBridge {
+                  @JavascriptInterface
+                  public boolean isNativeMlKitAvailable() {
+                      return true;
+                  }
+
+                  @JavascriptInterface
+                  public void scanFrameAsync(final String base64Jpeg, final String mode) {
+                      if (!isMlKitBusy.compareAndSet(false, true)) {
+                          return;
+                      }
+                      mlExecutor.execute(() -> {
+                          try {
+                              byte[] decoded = Base64.decode(base64Jpeg, Base64.DEFAULT);
+                              Bitmap bitmap = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
+                              if (bitmap == null) {
+                                  sendResult("", "");
+                                  return;
+                              }
+                              InputImage image = InputImage.fromBitmap(bitmap, 0);
+                              if ("ocr_only".equals(mode)) {
+                                  textRecognizer.process(image)
+                                      .addOnSuccessListener(visionText -> {
+                                          String txt = visionText != null ? visionText.getText() : "";
+                                          bitmap.recycle();
+                                          sendResult("", txt);
+                                      })
+                                      .addOnFailureListener(e -> {
+                                          bitmap.recycle();
+                                          sendResult("", "");
+                                      });
+                                  return;
+                              }
+                              barcodeScanner.process(image)
+                                  .addOnSuccessListener(barcodes -> {
+                                      String bcValue = "";
+                                      if (barcodes != null && !barcodes.isEmpty()) {
+                                          for (Barcode b : barcodes) {
+                                              if (b.getRawValue() != null && !b.getRawValue().isEmpty()) {
+                                                  bcValue = b.getRawValue();
+                                                  break;
+                                              }
+                                          }
+                                      }
+                                      final String finalBc = bcValue;
+                                      if ("barcode_only".equals(mode) && !finalBc.isEmpty()) {
+                                          bitmap.recycle();
+                                          sendResult(finalBc, "");
+                                          return;
+                                      }
+                                      textRecognizer.process(image)
+                                          .addOnSuccessListener(visionText -> {
+                                              String txt = visionText != null ? visionText.getText() : "";
+                                              bitmap.recycle();
+                                              sendResult(finalBc, txt);
+                                          })
+                                          .addOnFailureListener(e -> {
+                                              bitmap.recycle();
+                                              sendResult(finalBc, "");
+                                          });
+                                  })
+                                  .addOnFailureListener(e -> {
+                                      bitmap.recycle();
+                                      sendResult("", "");
+                                  });
+                          } catch (Exception e) {
+                              sendResult("", "");
+                          }
+                      });
+                  }
+
+                  private void sendResult(final String barcode, final String text) {
+                      isMlKitBusy.set(false);
+                      runOnUiThread(() -> {
+                          try {
+                              JSONObject obj = new JSONObject();
+                              obj.put("barcode", barcode != null ? barcode : "");
+                              obj.put("text", text != null ? text : "");
+                              String js = "if(window.onNativeMlKitResult){window.onNativeMlKitResult(" + obj.toString() + ");}";
+                              getBridge().getWebView().evaluateJavascript(js, null);
+                          } catch (Exception ignored) {}
+                      });
+                  }
+              }
+          }
+          JAVA
+
+      - name: Build APK with Gradle
+        working-directory: ./build_app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../../Linella_Fresh_PRO.apk
+
+      - name: Upload APK to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Linella-Fresh-PRO-Android-APK
+          path: Linella_Fresh_PRO.apk
